@@ -4,6 +4,7 @@ https://www.oracle.com/virtualization/technologies/vm/downloads/virtualbox-downl
 
 STEP 1:
 Download Ubuntu Server iso version 26.04.1
+
 https://ubuntu.com/download/server/thank-you?version=26.04.1&architecture=amd64&lts=true
 
 STEP 2: 
