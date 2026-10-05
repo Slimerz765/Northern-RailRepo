@@ -8,7 +8,9 @@ Download Ubuntu Server iso version 26.04.1
 https://ubuntu.com/download/server/thank-you?version=26.04.1&architecture=amd64&lts=true
 
 STEP 2: 
-Run the Deploy script to set up a VM
+Run DeployVM.ps1 in Powershell to set up a VM
 
 STEP 3:
 Wait for the VM to boot
+
+
