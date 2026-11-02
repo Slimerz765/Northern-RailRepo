@@ -3,16 +3,14 @@
 # Ubuntu VM - Automatic Multi-VM Deployment
 # VirtualBox 7.2 / Windows / Ubuntu Server
 #
-# Automatically creates:
-#   Ubuntu-VM1 -> 192.168.56.10
-#   Ubuntu-VM2 -> 192.168.56.11
-#   Ubuntu-VM3 -> 192.168.56.12
-#   etc.
+# Automatic naming:
+#   Ubuntu-VM1, Ubuntu-VM2, Ubuntu-VM3...
 #
-# Requirements:
-#   - VirtualBox 7.2
-#   - Ubuntu OVA with cloud-init installed and enabled
-#   - WSL with cloud-image-utils installed
+# Static IP allocation:
+#   Ubuntu-VM1 = 192.168.56.10
+#   Ubuntu-VM2 = 192.168.56.11
+#   Ubuntu-VM3 = 192.168.56.12
+#
 # ============================================================
 
 $ErrorActionPreference = "Stop"
@@ -21,25 +19,23 @@ $ErrorActionPreference = "Stop"
 
 $VBoxManage = "C:\Program Files\Oracle\VirtualBox\VBoxManage.exe"
 $OVA = "C:\VMImages\Ubuntu-Server-Base.ova"
-$VMBaseFolder = "C:\VMs"
-
 $VMPrefix = "Ubuntu-VM"
+$VMBaseFolder = "C:\VMs"
 
 $HostIP = "192.168.56.1"
 $DHCPServerIP = "192.168.56.2"
 $Netmask = "255.255.255.0"
 
-# DHCP range is deliberately separate from static VM addresses.
 $DHCPStartIP = "192.168.56.100"
 $DHCPEndIP = "192.168.56.200"
 
-# Static VM IP allocation.
+# Static IP allocation.
 $IPPrefix = "192.168.56."
+$FirstVMNumber = 1
+$LastVMNumber = 90
 $FirstVMIP = 10
-$LastVMIP = 99
 
 $SSHPort = 22
-$SSHUser = "ubuntuvirtualbox"
 $TimeoutMinutes = 10
 
 # -------------------- VBOXMANAGE HELPER --------------------
@@ -53,6 +49,7 @@ function Invoke-VBox {
     $OldPreference = $ErrorActionPreference
 
     try {
+        # Native VBoxManage commands can emit progress/errors on stderr.
         $ErrorActionPreference = "Continue"
         $Output = @(& $VBoxManage @Arguments 2>&1)
         $ExitCode = $LASTEXITCODE
@@ -76,13 +73,23 @@ function Invoke-VBox {
 
 # -------------------- UNIQUE MAC GENERATOR --------------------
 
+
 function New-UniqueMAC {
 
     $Bytes = New-Object byte[] 3
 
-    [System.Security.Cryptography.RandomNumberGenerator]::Fill($Bytes)
+    $Generator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
 
-    # VirtualBox OUI followed by random bytes.
+    try {
+        $Generator.GetBytes($Bytes)
+    }
+    finally {
+        $Generator.Dispose()
+    }
+
+    # VirtualBox-compatible MAC:
+    # 08:00:27 followed by three random bytes.
+
     $RandomPart = ($Bytes | ForEach-Object {
         $_.ToString("X2")
     }) -join ""
@@ -90,10 +97,168 @@ function New-UniqueMAC {
     return "080027$RandomPart"
 }
 
-# -------------------- DISCOVER HOST-ONLY ADAPTERS --------------------
 
-function Get-HostOnlyAdapters {
+# -------------------- ADMINISTRATOR / PREREQUISITES --------------------
 
+Write-Host "`nChecking prerequisites..." -ForegroundColor Cyan
+
+$Identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$Principal = [Security.Principal.WindowsPrincipal]::new($Identity)
+
+if (-not $Principal.IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator
+)) {
+    throw "Run PowerShell as Administrator."
+}
+
+if (-not (Test-Path $VBoxManage -PathType Leaf)) {
+    throw "VBoxManage.exe not found: $VBoxManage"
+}
+
+if (-not (Test-Path $OVA -PathType Leaf)) {
+    throw "OVA image not found: $OVA"
+}
+
+New-Item -ItemType Directory -Path $VMBaseFolder -Force |
+    Out-Null
+
+# ============================================================
+# AUTOMATIC VM NAME AND IP ALLOCATION
+# ============================================================
+
+Write-Host "`nFinding next available VM..." -ForegroundColor Cyan
+
+$RegisteredVMs = Invoke-VBox @("list", "vms")
+
+$ExistingNames = @()
+
+foreach ($Line in $RegisteredVMs) {
+
+    if ("$Line" -match '^"(.+)"\s+\{[0-9a-f-]+\}$') {
+        $ExistingNames += $Matches[1]
+    }
+}
+
+$VM = $null
+$VMIP = $null
+$VMNumber = $null
+$VMFolder = $null
+
+for ($Number = $FirstVMNumber; $Number -le $LastVMNumber; $Number++) {
+
+    $CandidateVM = "$VMPrefix$Number"
+
+    # VM1 gets .10, VM2 gets .11, etc.
+    $CandidateIPNumber = $FirstVMIP + $Number - $FirstVMNumber
+
+    $CandidateIP = "$IPPrefix$CandidateIPNumber"
+
+    $CandidateFolder = Join-Path $VMBaseFolder $CandidateVM
+
+    $NameExists = $ExistingNames -contains $CandidateVM
+
+    $FolderExists = Test-Path -LiteralPath $CandidateFolder
+
+    if (-not $NameExists -and -not $FolderExists) {
+
+        $VM = $CandidateVM
+        $VMIP = $CandidateIP
+        $VMNumber = $Number
+        $VMFolder = $CandidateFolder
+
+        break
+    }
+}
+
+if (-not $VM) {
+    throw "No available VM numbers remain. Maximum configured VM number: $LastVMNumber"
+}
+
+Write-Host "Selected VM: $VM" -ForegroundColor Green
+Write-Host "Assigned static IP: $VMIP" -ForegroundColor Green
+
+# ============================================================
+# GENERATE UNIQUE MAC ADDRESSES
+# ============================================================
+
+Write-Host "`nGenerating unique MAC addresses..." -ForegroundColor Cyan
+
+$NatMAC = New-UniqueMAC
+$HostOnlyMAC = New-UniqueMAC
+
+Write-Host "NAT MAC: $NatMAC"
+Write-Host "Host-only MAC: $HostOnlyMAC"
+
+# ============================================================
+# DISCOVER OR CREATE HOST-ONLY ADAPTER
+# ============================================================
+
+Write-Host "`nDiscovering host-only network..." -ForegroundColor Cyan
+
+$Output = Invoke-VBox @("list", "hostonlyifs")
+
+$Adapters = @()
+$Current = $null
+
+foreach ($Line in $Output) {
+
+    if ("$Line" -match '^\s*Name:\s*(.+?)\s*$') {
+
+        if ($null -ne $Current) {
+            $Adapters += [pscustomobject]$Current
+        }
+
+        $Current = @{
+            Name = $Matches[1]
+            IPAddress = ""
+        }
+    }
+    elseif ("$Line" -match '^\s*IPAddress:\s*(.+?)\s*$') {
+
+        if ($null -ne $Current) {
+            $Current.IPAddress = $Matches[1]
+        }
+    }
+}
+
+if ($null -ne $Current) {
+    $Adapters += [pscustomobject]$Current
+}
+
+# Prefer an adapter already configured with the required host IP.
+$Adapter = $Adapters |
+    Where-Object {
+        $_.IPAddress -eq $HostIP
+    } |
+    Select-Object -First 1
+
+# Otherwise reuse an existing adapter.
+if (-not $Adapter -and $Adapters.Count -gt 0) {
+    $Adapter = $Adapters[0]
+}
+
+# Create an adapter if none exists.
+if (-not $Adapter) {
+
+    Write-Host "No host-only adapter found. Creating one..." `
+        -ForegroundColor Yellow
+
+    $OldPreference = $ErrorActionPreference
+
+    try {
+        $ErrorActionPreference = "Continue"
+        & $VBoxManage hostonlyif create
+        $CreateExitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $OldPreference
+    }
+
+    if ($CreateExitCode -ne 0) {
+        throw "Failed to create host-only adapter. Exit code: $CreateExitCode"
+    }
+
+    # Rediscover adapters after creation.
     $Output = Invoke-VBox @("list", "hostonlyifs")
 
     $Adapters = @()
@@ -124,147 +289,8 @@ function Get-HostOnlyAdapters {
         $Adapters += [pscustomobject]$Current
     }
 
-    return $Adapters
-}
-
-# -------------------- ADMINISTRATOR / PREREQUISITES --------------------
-
-Write-Host "`nChecking prerequisites..." -ForegroundColor Cyan
-
-$Identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-$Principal = [Security.Principal.WindowsPrincipal]::new($Identity)
-
-if (-not $Principal.IsInRole(
-    [Security.Principal.WindowsBuiltInRole]::Administrator
-)) {
-    throw "Run PowerShell as Administrator."
-}
-
-if (-not (Test-Path $VBoxManage -PathType Leaf)) {
-    throw "VBoxManage.exe not found: $VBoxManage"
-}
-
-if (-not (Test-Path $OVA -PathType Leaf)) {
-    throw "OVA image not found: $OVA"
-}
-
-if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
-    throw "Windows Subsystem for Linux (WSL) is required to generate cloud-init ISO files."
-}
-
-New-Item -ItemType Directory -Path $VMBaseFolder -Force |
-    Out-Null
-
-# Check cloud-localds inside WSL.
-$CloudLocalDS = & wsl.exe -- bash -lc "command -v cloud-localds" 2>$null
-
-if ($LASTEXITCODE -ne 0 -or -not $CloudLocalDS) {
-    throw @"
-cloud-localds is missing from WSL.
-
-Install it inside your WSL Ubuntu distribution using:
-
-sudo apt update
-sudo apt install -y cloud-image-utils
-
-Then run this deployment script again.
-"@
-}
-
-Write-Host "Prerequisites passed." -ForegroundColor Green
-
-# ============================================================
-# AUTOMATIC VM NAME AND STATIC IP ALLOCATION
-# ============================================================
-
-Write-Host "`nFinding next available VM number..." -ForegroundColor Cyan
-
-$RegisteredVMs = Invoke-VBox @("list", "vms")
-
-$VMNumber = $FirstVMIP
-$VM = $null
-$VMIP = $null
-$VMFolder = $null
-
-while ($VMNumber -le $LastVMIP) {
-
-    $CandidateVM = "$VMPrefix$($VMNumber - $FirstVMIP + 1)"
-    $CandidateIP = "$IPPrefix$VMNumber"
-    $CandidateFolder = Join-Path $VMBaseFolder $CandidateVM
-
-    $NameExists = $false
-
-    foreach ($Line in $RegisteredVMs) {
-
-        if ("$Line" -match '^"(.+)"\s+\{[0-9a-f-]+\}$') {
-
-            if ($Matches[1] -eq $CandidateVM) {
-                $NameExists = $true
-                break
-            }
-        }
-    }
-
-    $FolderExists = Test-Path -LiteralPath $CandidateFolder
-
-    if (-not $NameExists -and -not $FolderExists) {
-
-        $VM = $CandidateVM
-        $VMIP = $CandidateIP
-        $VMFolder = $CandidateFolder
-
-        break
-    }
-
-    $VMNumber++
-}
-
-if (-not $VM) {
-    throw "No available VM names or static IP addresses remain in the configured range."
-}
-
-Write-Host "Selected VM: $VM" -ForegroundColor Green
-Write-Host "Static IP: $VMIP" -ForegroundColor Green
-
-# ============================================================
-# GENERATE UNIQUE MAC ADDRESSES
-# ============================================================
-
-$NatMAC = New-UniqueMAC
-$HostOnlyMAC = New-UniqueMAC
-
-Write-Host "`nGenerated network addresses:" -ForegroundColor Cyan
-Write-Host "NAT MAC: $NatMAC"
-Write-Host "Host-only MAC: $HostOnlyMAC"
-
-# ============================================================
-# DISCOVER OR CREATE HOST-ONLY ADAPTER
-# ============================================================
-
-Write-Host "`nDiscovering host-only network..." -ForegroundColor Cyan
-
-$Adapters = @(Get-HostOnlyAdapters)
-
-$Adapter = $Adapters |
-    Where-Object {
-        $_.IPAddress -eq $HostIP
-    } |
-    Select-Object -First 1
-
-if (-not $Adapter -and $Adapters.Count -gt 0) {
-    $Adapter = $Adapters[0]
-}
-
-if (-not $Adapter) {
-
-    Write-Host "Creating host-only adapter..." -ForegroundColor Yellow
-
-    Invoke-VBox @("hostonlyif", "create") | Out-Null
-
-    $Adapters = @(Get-HostOnlyAdapters)
-
     if ($Adapters.Count -eq 0) {
-        throw "Failed to discover the newly created host-only adapter."
+        throw "No host-only adapter found after creation."
     }
 
     $Adapter = $Adapters[-1]
@@ -274,14 +300,14 @@ $HostOnlyAdapter = $Adapter.Name
 
 Write-Host "Selected adapter: $HostOnlyAdapter" -ForegroundColor Green
 
-# Configure host-only adapter.
+# Configure the selected adapter.
 Invoke-VBox @(
     "hostonlyif", "ipconfig", $HostOnlyAdapter,
     "--ip", $HostIP,
     "--netmask", $Netmask
 ) | Out-Null
 
-# Verify Windows adapter.
+# Verify the corresponding Windows adapter.
 $WindowsAdapter = Get-NetAdapter -IncludeHidden |
     Where-Object {
         $_.Name -eq $HostOnlyAdapter -or
@@ -290,7 +316,7 @@ $WindowsAdapter = Get-NetAdapter -IncludeHidden |
     Select-Object -First 1
 
 if (-not $WindowsAdapter) {
-    throw "Windows network adapter not found: $HostOnlyAdapter"
+    throw "Windows network adapter not found for '$HostOnlyAdapter'."
 }
 
 $AddressFound = Get-NetIPAddress `
@@ -302,13 +328,13 @@ $AddressFound = Get-NetIPAddress `
     }
 
 if (-not $AddressFound) {
-    throw "Host IP $HostIP was not found on the Windows adapter."
+    throw "Host IP $HostIP not found on Windows adapter '$($WindowsAdapter.Name)'."
 }
 
-Write-Host "Host-only network ready." -ForegroundColor Green
+Write-Host "Host-only network ready: $HostIP/24" -ForegroundColor Green
 
 # ============================================================
-# CONFIGURE HOST-ONLY DHCP SERVER
+# CONFIGURE OR CREATE HOST-ONLY DHCP SERVER
 # ============================================================
 
 Write-Host "`nConfiguring host-only DHCP server..." -ForegroundColor Cyan
@@ -318,7 +344,20 @@ $DHCPText = $DHCPOutput -join "`n"
 
 $NetworkName = "HostInterfaceNetworking-$HostOnlyAdapter"
 
-$DHCPExists = $DHCPText -match [regex]::Escape($NetworkName)
+$DHCPExists = $false
+
+$Blocks = [regex]::Split(
+    $DHCPText,
+    '(?m)(?=^\s*NetworkName:)'
+)
+
+foreach ($Block in $Blocks) {
+
+    if ($Block -match [regex]::Escape($NetworkName)) {
+        $DHCPExists = $true
+        break
+    }
+}
 
 $DHCPArgs = @(
     "--interface=$HostOnlyAdapter",
@@ -331,7 +370,8 @@ $DHCPArgs = @(
 
 if ($DHCPExists) {
 
-    Write-Host "Updating existing DHCP server..." -ForegroundColor Yellow
+    Write-Host "Existing DHCP server found. Updating..." `
+        -ForegroundColor Yellow
 
     $ModifyArgs = @("dhcpserver", "modify") + $DHCPArgs
 
@@ -339,7 +379,8 @@ if ($DHCPExists) {
 }
 else {
 
-    Write-Host "Creating DHCP server..." -ForegroundColor Yellow
+    Write-Host "No DHCP server found. Creating one..." `
+        -ForegroundColor Yellow
 
     $AddArgs = @("dhcpserver", "add") + $DHCPArgs
 
@@ -375,7 +416,7 @@ if ($ImportExitCode -ne 0) {
     throw "OVA import failed. Exit code: $ImportExitCode"
 }
 
-# Verify VM registration.
+# Verify registration before configuring hardware.
 $RegisteredVMs = Invoke-VBox @("list", "vms")
 
 $VMRegistered = $false
@@ -392,108 +433,19 @@ foreach ($Line in $RegisteredVMs) {
 }
 
 if (-not $VMRegistered) {
-    throw "Imported VM is not registered."
+    throw "Import finished, but '$VM' is not registered."
 }
 
 Write-Host "VM imported successfully." -ForegroundColor Green
-
-# ============================================================
-# CREATE CLOUD-INIT CONFIGURATION
-# ============================================================
-
-Write-Host "`nCreating VM-specific cloud-init configuration..." -ForegroundColor Cyan
-
-$SeedFolder = Join-Path $env:TEMP "CloudInit-$VM"
-
-New-Item -ItemType Directory -Path $SeedFolder -Force |
-    Out-Null
-
-$UserDataFile = Join-Path $SeedFolder "user-data"
-$MetaDataFile = Join-Path $SeedFolder "meta-data"
-$NetworkFile = Join-Path $SeedFolder "network-config"
-
-$SeedISO = Join-Path $VMFolder "$VM-cloud-init.iso"
-
-$NatMACFormatted = ($NatMAC -replace '(.{2})(?!$)', '$1:').ToLower()
-$HostMACFormatted = ($HostOnlyMAC -replace '(.{2})(?!$)', '$1:').ToLower()
-
-# Unique cloud-init instance ID for each deployment.
-$InstanceID = [guid]::NewGuid().ToString()
-
-$UserData = @"
-#cloud-config
-hostname: $VM
-preserve_hostname: false
-"@
-
-$MetaData = @"
-instance-id: $InstanceID
-local-hostname: $VM
-"@
-
-# Adapter 1: NAT with DHCP for internet access.
-# Adapter 2: genuinely static host-only IP.
-$NetworkConfig = @"
-version: 2
-ethernets:
-  nat:
-    match:
-      macaddress: '$NatMACFormatted'
-    dhcp4: true
-    dhcp6: false
-  hostonly:
-    match:
-      macaddress: '$HostMACFormatted'
-    dhcp4: false
-    dhcp6: false
-    addresses:
-      - $VMIP/24
-"@
-
-Set-Content -LiteralPath $UserDataFile -Value $UserData -Encoding ASCII
-Set-Content -LiteralPath $MetaDataFile -Value $MetaData -Encoding ASCII
-Set-Content -LiteralPath $NetworkFile -Value $NetworkConfig -Encoding ASCII
-
-# Convert Windows paths to WSL paths.
-$WslUserData = (& wsl.exe wslpath -a $UserDataFile).Trim()
-$WslMetaData = (& wsl.exe wslpath -a $MetaDataFile).Trim()
-$WslNetwork = (& wsl.exe wslpath -a $NetworkFile).Trim()
-$WslISO = (& wsl.exe wslpath -a $SeedISO).Trim()
-
-if ($LASTEXITCODE -ne 0) {
-    throw "Failed to convert cloud-init paths for WSL."
-}
-
-# Generate NoCloud seed ISO.
-$OldPreference = $ErrorActionPreference
-
-try {
-
-    $ErrorActionPreference = "Continue"
-
-    & wsl.exe -- cloud-localds `
-        "--network-config=$WslNetwork" `
-        $WslISO `
-        $WslUserData `
-        $WslMetaData
-
-    $ISOExitCode = $LASTEXITCODE
-}
-finally {
-    $ErrorActionPreference = $OldPreference
-}
-
-if ($ISOExitCode -ne 0 -or -not (Test-Path $SeedISO)) {
-    throw "Failed to generate cloud-init ISO."
-}
-
-Write-Host "Cloud-init ISO generated." -ForegroundColor Green
 
 # ============================================================
 # CONFIGURE VM NETWORK ADAPTERS
 # ============================================================
 
 Write-Host "`nConfiguring VM network adapters..." -ForegroundColor Cyan
+
+# Adapter 1: NAT for outbound Internet access.
+# Adapter 2: host-only for the private host/guest network.
 
 Invoke-VBox @(
     "modifyvm", $VM,
@@ -505,41 +457,13 @@ Invoke-VBox @(
 ) | Out-Null
 
 # ============================================================
-# ATTACH CLOUD-INIT ISO
-# ============================================================
-
-Write-Host "`nAttaching cloud-init configuration..." -ForegroundColor Cyan
-
-Invoke-VBox @(
-    "storagectl", $VM,
-    "--name", "CloudInit",
-    "--add", "ide"
-) | Out-Null
-
-Invoke-VBox @(
-    "storageattach", $VM,
-    "--storagectl", "CloudInit",
-    "--port", "0",
-    "--device", "0",
-    "--type", "dvddrive",
-    "--medium", $SeedISO
-) | Out-Null
-
-# Ensure the VM boots from its existing disk.
-Invoke-VBox @(
-    "modifyvm", $VM,
-    "--boot1", "disk",
-    "--boot2", "dvd"
-) | Out-Null
-
-# ============================================================
-# CHECK VM STATE
+# VERIFY VM STATE
 # ============================================================
 
 $VMInfo = Invoke-VBox @("showvminfo", $VM, "--machinereadable")
 
 if ($VMInfo -match '(?m)^VMState="saved"$') {
-    throw "VM is in a saved state. Manual inspection required."
+    throw "VM is in a saved state. Discard the saved state manually and retry."
 }
 
 # ============================================================
@@ -554,7 +478,8 @@ Invoke-VBox @("startvm", $VM, "--type", "gui") | Out-Null
 # WAIT FOR SSH
 # ============================================================
 
-Write-Host "`nWaiting for SSH at ${VMIP}:$SSHPort ..." -ForegroundColor Cyan
+Write-Host "`nWaiting for SSH at ${VMIP}:$SSHPort ..." `
+    -ForegroundColor Cyan
 
 $Deadline = (Get-Date).AddMinutes($TimeoutMinutes)
 $SSHReady = $false
@@ -593,23 +518,13 @@ Expected static IP: $VMIP
 
 Check:
 1. Ubuntu booted successfully.
-2. Cloud-init is installed and enabled in the OVA.
-3. The NoCloud datasource was detected.
-4. The host-only interface received $VMIP.
-5. openssh-server is installed and running.
+2. The guest host-only interface is configured.
+3. Ubuntu has static IP $VMIP.
+4. openssh-server is installed and running.
 
 The VM has been left running for inspection.
 "@
 }
-
-# ============================================================
-# CLEAN UP TEMPORARY CONFIGURATION
-# ============================================================
-
-# The seed ISO is retained in the VM folder for troubleshooting.
-# Temporary source files are no longer needed.
-
-Remove-Item -LiteralPath $SeedFolder -Recurse -Force -ErrorAction SilentlyContinue
 
 # ============================================================
 # FINISHED
@@ -620,6 +535,8 @@ Write-Host " VM DEPLOYED - SSH PORT REACHABLE" -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Green
 
 Write-Host "VM: $VM"
+Write-Host "VM number: $VMNumber"
+Write-Host "VM folder: $VMFolder"
 Write-Host "Host-only adapter: $HostOnlyAdapter"
 Write-Host "Host IP: $HostIP"
 Write-Host "Guest static IP: $VMIP"
@@ -628,6 +545,6 @@ Write-Host "Host-only MAC: $HostOnlyMAC"
 Write-Host "Internet: NAT"
 Write-Host ""
 Write-Host "Connect using:"
-Write-Host "ssh ${SSHUser}@${VMIP}"
+Write-Host "ssh ubuntuvirtualbox@$VMIP"
 Write-Host ""
 Write-Host "Note: TCP port reachability does not verify SSH authentication."
